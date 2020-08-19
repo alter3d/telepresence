@@ -368,6 +368,20 @@ def parse_args(in_args: Optional[List[str]] = None) -> argparse.Namespace:
             " workaround that may help."
         )
     )
+    parser.add_argument(
+        "--exclude-cidr",
+        metavar="NETWORK/MASK",
+        dest="exclude_cidr",
+        action='append',
+        default=[],
+        help=(
+            "If you need to use --method=vpn-tcp in conjunction with a "
+            "separate VPN and are having connection issues, this MAY help "
+            "in certain topologies on certain platforms by preventing NAT "
+            "rules from being created for pod and service IPs in the specified "
+            "CIDR prefix.  Linux typically does not need this, but OSX does."
+        )
+    )
 
     mount_group = parser.add_mutually_exclusive_group()
     mount_group.add_argument(

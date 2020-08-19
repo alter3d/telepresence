@@ -119,11 +119,12 @@ def launch_vpn(
     also_proxy: List[str],
     env_overrides: Dict[str, str],
     ssh: SSH,
+    exclude_cidr: List[str]
 ) -> Popen:
     """
     Launch sshuttle and the user's command
     """
-    connect_sshuttle(runner, remote_info, also_proxy, ssh)
+    connect_sshuttle(runner, remote_info, also_proxy, ssh, exclude_cidr)
     _flush_dns_cache(runner)
     env = get_local_env(runner, env_overrides, False)
     runner.show("Setup complete. Launching your command.")

@@ -60,7 +60,8 @@ sys.stdout.flush()
 
 
 def get_proxy_cidrs(
-    runner: Runner, remote_info: RemoteInfo, hosts_or_ips: List[str]
+    runner: Runner, remote_info: RemoteInfo, hosts_or_ips: List[str],
+    exclude_cidrs: List[str]
 ) -> List[str]:
     """
     Figure out which IP ranges to route via sshuttle.
@@ -79,11 +80,33 @@ def get_proxy_cidrs(
     # Run script to convert --also-proxy hostnames to IPs, doing name
     # resolution inside Kubernetes, so we get cloud-local IP addresses for
     # cloud resources:
-    result = set(k8s_resolve(runner, remote_info, hosts_or_ips))
+    result = set(k8s_resolve(runner, remote_info, hosts_or_ips, exclude_cidrs))
     context_cache = runner.cache.child(runner.kubectl.context)
-    result.update(context_cache.lookup("podCIDRs", lambda: podCIDRs(runner)))
+
+    # Invalidate the cache if the current list of exclude_cidrs doesn't match
+    # the previously cached values.  This ensures the user's intent is
+    # respected if exclude_cidrs changes.
+    cache_excludes = context_cache.lookup("excludeCIDRs",
+                                          lambda: sorted(exclude_cidrs)
+                     )
+    if sorted(cache_excludes) != sorted(exclude_cidrs):
+        runner.show("List of --exclude-cidr has changed; invalidating cache.")
+        context_cache.invalidate(-1)
+        # After invalidating the cache, re-inject our exclude_cidrs
+        context_cache.lookup("excludeCIDRs",
+                             lambda: sorted(exclude_cidrs)
+        )
+
+    result.update(
+        context_cache.lookup("podCIDRs",
+                             lambda: podCIDRs(runner, exclude_cidrs)
+        )
+    )
+
     result.add(
-        context_cache.lookup("serviceCIDR", lambda: serviceCIDR(runner))
+        context_cache.lookup("serviceCIDR",
+                             lambda: serviceCIDR(runner, exclude_cidrs)
+        )
     )
 
     span.end()
@@ -91,7 +114,8 @@ def get_proxy_cidrs(
 
 
 def k8s_resolve(
-    runner: Runner, remote_info: RemoteInfo, hosts_or_ips: List[str]
+    runner: Runner, remote_info: RemoteInfo, hosts_or_ips: List[str],
+    exclude_cidrs: List[str]
 ) -> List[str]:
     """
     Resolve a list of host and/or ip addresses inside the cluster
@@ -110,6 +134,11 @@ def k8s_resolve(
         except ValueError:
             pass
         else:
+            # Skip IPs that fall into an --exclude-cidr range
+            for exclude_range in exclude_cidrs:
+                exclude_net = ipaddress.ip_network(exclude_range)
+                if addr.subnet_of(exclude_net):
+                    continue
             ip_ranges.append(str(addr))
             continue
 
@@ -144,13 +173,21 @@ def k8s_resolve(
 
     resolved_ips = []  # type: List[str]
     for host, ips in zip(hostnames, hostname_ips):
-        ipcache[host] = ips
-        resolved_ips += ips
+        # Remove resolved IPs that fall into a --exclude-cidr range
+        for exclude_cidr in exclude_cidrs:
+            exclude_net = ipaddress.ip_network(exclude_cidr)
+            for ip in ips.copy():
+                ip_net = ipaddress.ip_network(ip)
+                if ip_net.subnet_of(exclude_net):
+                    ips.remove(ip)
+        if len(ips) > 0:
+            ipcache[host] = ips
+            resolved_ips += ips
 
     return resolved_ips + ip_ranges
 
 
-def podCIDRs(runner: Runner):
+def podCIDRs(runner: Runner, exclude_cidrs: List[str]):
     """
     Get pod IPs from nodes if possible, otherwise use pod IPs as heuristic:
     """
@@ -191,10 +228,18 @@ def podCIDRs(runner: Runner):
         if pod_ips:
             cidrs.add(covering_cidr(pod_ips))
 
+    # Remove IPs that fall into a --exclude-cidr range
+    for cidr in cidrs.copy():
+        cidr_net = ipaddress.ip_network(cidr)
+        for exclude_cidr in exclude_cidrs:
+            exclude_net = ipaddress.ip_network(exclude_cidr)
+            if cidr_net.subnet_of(exclude_net):
+                cidrs.remove(cidr)
+
     return list(cidrs)
 
 
-def serviceCIDR(runner: Runner):
+def serviceCIDR(runner: Runner, exclude_cidrs: List[str]):
     """
     Get service IP range, based on heuristic of constructing CIDR from
     existing Service IPs. We create more services if there are less
@@ -211,6 +256,14 @@ def serviceCIDR(runner: Runner):
         ]
 
     service_ips = get_service_ips()
+
+    for addr in service_ips.copy():
+        addr_net = ipaddress.ip_network(addr)
+        for exclude_range in exclude_cidrs:
+            exclude_net = ipaddress.ip_network(exclude_range)
+            if addr_net.subnet_of(exclude_net):
+                service_ips.remove(addr)
+
     new_services = []  # type: List[str]
     # Ensure we have at least 8 ClusterIP Services:
     while len(service_ips) + len(new_services) < 8:
@@ -274,7 +327,8 @@ def dns_lookup(runner: Runner, name: str, timeout: int) -> bool:
 
 
 def connect_sshuttle(
-    runner: Runner, remote_info: RemoteInfo, hosts_or_ips: List[str], ssh: SSH
+    runner: Runner, remote_info: RemoteInfo, hosts_or_ips: List[str], ssh: SSH,
+    exclude_cidrs: List[str]
 ) -> None:
     """Connect to Kubernetes using sshuttle."""
     span = runner.span()
@@ -288,7 +342,7 @@ def connect_sshuttle(
             # DNS proxy running on remote pod:
             "--to-ns",
             "127.0.0.1:9053",
-        ] + get_proxy_cidrs(runner, remote_info, hosts_or_ips),
+        ] + get_proxy_cidrs(runner, remote_info, hosts_or_ips, exclude_cidrs),
         keep_session=True,  # Avoid trouble with interactive sudo
     )
 
